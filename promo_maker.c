@@ -411,7 +411,7 @@ static int path_exists(const char *p) {
 static int is_directory(const char *p) {
     struct stat st;
     if (stat(p, &st) != 0) return 0;
-    return (st.st_mode & S_IFMT) == S_IFDIR;
+    return S_ISDIR(st.st_mode);
 }
 
 /* Delete prior outputs in output_dir whose filename matches exactly
@@ -474,7 +474,7 @@ static void cleanup_prior_outputs(const char *output_dir,
                     "cannot stat \"%s\": %s\n", full, strerror(errno));
             continue;
         }
-        if ((st.st_mode & S_IFMT) != S_IFREG) continue;
+        if (!S_ISREG(st.st_mode)) continue;
 
         if (unlink(full) != 0) {
             fprintf(stderr, ANSI_YELLOW "warning: " ANSI_RESET
