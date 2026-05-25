@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Third-party headers: suppress warnings we don't control. */
 #pragma GCC diagnostic push
@@ -63,6 +65,7 @@ typedef struct {
     long        size;
     uint32_t    color;     /* 0x00RRGGBB */
     int         force;
+    int         no_cleanup;
     int         have_x;
     int         have_y;
     int         have_size;
@@ -102,6 +105,8 @@ static void usage(FILE *out) {
         "  -c, --color  <RRGGBB>  hex text color (default FFFFFF)\n"
         "  -t, --time   <str>     line-2 text (default \"%s\")\n"
         "      --force            allow overwrite of output file\n"
+        "      --no-cleanup       keep prior <stem>_YYYY-MM-DD.png files in output dir\n"
+        "                         (default: delete them after a successful write)\n"
         "  -h, --help             this message\n",
         DEFAULT_TIME, MAX_PIXEL_PX, DEFAULT_TIME);
 }
@@ -198,6 +203,10 @@ static void parse_args(int argc, char **argv, opts_t *o) {
         if (match_long(a, "force",  &vi)) {
             if (vi) die("--force does not take a value");
             o->force = 1; continue;
+        }
+        if (match_long(a, "no-cleanup", &vi)) {
+            if (vi) die("--no-cleanup does not take a value");
+            o->no_cleanup = 1; continue;
         }
 
         /* Short flags. Each takes the next argv slot as its value. */
@@ -405,6 +414,78 @@ static int is_directory(const char *p) {
     return (st.st_mode & S_IFMT) == S_IFDIR;
 }
 
+/* Delete prior outputs in output_dir whose filename matches exactly
+ * <stem>_YYYY-MM-DD.png (case-insensitive ".png"). Skips new_basename so we
+ * never touch the file we just wrote. Refuses anything that isn't a regular
+ * file via lstat -- no directories deleted, no symlinks followed. Errors are
+ * non-fatal warnings; the new write has already succeeded. */
+static void cleanup_prior_outputs(const char *output_dir,
+                                  const char *stem,
+                                  const char *new_basename) {
+    DIR *d = opendir(output_dir);
+    if (!d) {
+        fprintf(stderr, ANSI_YELLOW "warning: " ANSI_RESET
+                "cannot scan \"%s\": %s\n", output_dir, strerror(errno));
+        return;
+    }
+
+    size_t stem_len = strlen(stem);
+    size_t expected_len = stem_len + 15;  /* '_' + YYYY-MM-DD + ".png" */
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        if (strlen(name) != expected_len) continue;
+        if (memcmp(name, stem, stem_len) != 0) continue;
+        if (name[stem_len] != '_') continue;
+
+        const char *date = name + stem_len + 1;
+        if (!isdigit((unsigned char)date[0]) ||
+            !isdigit((unsigned char)date[1]) ||
+            !isdigit((unsigned char)date[2]) ||
+            !isdigit((unsigned char)date[3]) ||
+            date[4] != '-' ||
+            !isdigit((unsigned char)date[5]) ||
+            !isdigit((unsigned char)date[6]) ||
+            date[7] != '-' ||
+            !isdigit((unsigned char)date[8]) ||
+            !isdigit((unsigned char)date[9]))
+            continue;
+
+        const char *ext = name + stem_len + 11;
+        if (ext[0] != '.') continue;
+        if (ext[1] != 'p' && ext[1] != 'P') continue;
+        if (ext[2] != 'n' && ext[2] != 'N') continue;
+        if (ext[3] != 'g' && ext[3] != 'G') continue;
+
+        if (strcmp(name, new_basename) == 0) continue;
+
+        char full[PATH_MAX];
+        int fn = snprintf(full, sizeof full, "%s/%s", output_dir, name);
+        if (fn < 0 || (size_t)fn >= sizeof full) {
+            fprintf(stderr, ANSI_YELLOW "warning: " ANSI_RESET
+                    "path too long, skipping \"%s\"\n", name);
+            continue;
+        }
+
+        struct stat st;
+        if (lstat(full, &st) != 0) {
+            fprintf(stderr, ANSI_YELLOW "warning: " ANSI_RESET
+                    "cannot stat \"%s\": %s\n", full, strerror(errno));
+            continue;
+        }
+        if ((st.st_mode & S_IFMT) != S_IFREG) continue;
+
+        if (unlink(full) != 0) {
+            fprintf(stderr, ANSI_YELLOW "warning: " ANSI_RESET
+                    "could not delete \"%s\": %s\n", full, strerror(errno));
+            continue;
+        }
+        printf(ANSI_YELLOW "removed " ANSI_RESET "%s\n", full);
+    }
+    closedir(d);
+}
+
 int main(int argc, char **argv) {
     opts_t opt;
     parse_args(argc, argv, &opt);
@@ -421,6 +502,9 @@ int main(int argc, char **argv) {
     if (n1 < 0 || (size_t)n1 >= sizeof line1) die("date format overflow");
     const char *line2 = opt.time_text;
 
+    char stem[256];
+    input_stem(opt.input, stem, sizeof stem);
+
     char out_path[PATH_MAX];
     int np;
     if (opt.out_name) {
@@ -433,8 +517,6 @@ int main(int argc, char **argv) {
         np = snprintf(out_path, sizeof out_path, "%s/%s%s",
                       opt.output_dir, opt.out_name, need_ext ? ".png" : "");
     } else {
-        char stem[256];
-        input_stem(opt.input, stem, sizeof stem);
         np = snprintf(out_path, sizeof out_path, "%s/%s_%04d-%02d-%02d.png",
                       opt.output_dir, stem, y_full, mon1, day);
     }
@@ -516,5 +598,12 @@ int main(int argc, char **argv) {
     printf(ANSI_GREEN "wrote " ANSI_RESET "%s\n", out_path);
     printf(ANSI_CYAN  "date  " ANSI_RESET "%s\n", line1);
     printf(ANSI_CYAN  "time  " ANSI_RESET "%s\n", line2);
+
+    if (!opt.no_cleanup) {
+        const char *new_basename = strrchr(out_path, '/');
+        new_basename = new_basename ? new_basename + 1 : out_path;
+        cleanup_prior_outputs(opt.output_dir, stem, new_basename);
+    }
+
     return 0;
 }
